@@ -9,14 +9,12 @@ from async_lru import alru_cache
 from tools.chat import chain
 from tools.mcp_adapter import mcp_adapter
 import time
-from concurrent.futures import ThreadPoolExecutor
 from aiolimiter import AsyncLimiter
 logger = logging.getLogger(__name__)
-API_TIMEOUT = 180.0
 LLM_RATE_LIMITER = AsyncLimiter(1, time_period=30.0)
 
 # ==================================================
-# 异步 + 缓存版本：获取 GitHub 文件内容
+# ✅ 异步 + 缓存版本：获取 GitHub 文件内容
 # ==================================================
 @alru_cache(maxsize=1024)
 async def _gh_raw(owner: str, repo: str, path: str, token: str) -> str | None:
@@ -30,9 +28,22 @@ async def _gh_raw(owner: str, repo: str, path: str, token: str) -> str | None:
     for attempt in range(MAX_RETRIES):
         try:
             r = await mcp_adapter.fetch(url, headers=headers)
+            status_code = r.status_code
+            #文件成功或不存在时，立即返回结果
+            if status_code == 200:
+                # 解析内容并返回
+                data = r.json()
+                if data.get("encoding") == "base64":
+                    # 注意：如果 base64 解码是 CPU 密集型，最好使用 asyncio.to_thread
+                    return base64.b64decode(data["content"]).decode("utf-8")
+                return data.get("content", "")
+            
+            if status_code == 404:
+                # 文件不存在，立即停止并返回 None
+                return None
             
             # ----------------------------------------------------
-            # 1. 处理 403 / 429 错误 (速率限制)
+            # 2. 处理 403 / 429 错误 (速率限制)
             # ----------------------------------------------------
             if r.status_code == 403 or r.status_code == 429:
                 reset_time_str = r.headers.get("X-Ratelimit-Reset")
@@ -51,28 +62,35 @@ async def _gh_raw(owner: str, repo: str, path: str, token: str) -> str | None:
                 )
                 await asyncio.sleep(delay)
                 continue # 进入下一次循环重试
-
-            if r.status_code == 404:
-                return None
-            elif r.status_code != 200:
-                logger.error(f"GitHub API error {r.status_code} for {owner}/{repo}/{path}")
-                return None
-
-   
-
-            data = r.json()
-            if data.get("encoding") == "base64":
-               return base64.b64decode(data["content"]).decode("utf-8")
-            return data.get("content", "")
-
+            logger.warning(
+                f"GitHub API unexpected error {status_code}. Retrying with delay. (Attempt {attempt + 1})"
+            )
+            # 使用简单的指数退避等待
+            delay = INITIAL_DELAY * (2 ** attempt)
+            await asyncio.sleep(delay)
+            continue # 进入下一次循环重试
+            
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as e:
-            logger.error(f"Network error ({type(e).__name__}) fetching {owner}/{repo}/{path}")
-        return None
+            # 捕获网络异常 (也属于瞬时错误)
+            logger.error(f"Network error ({type(e).__name__}) fetching {owner}/{repo}/{path}. Retrying.")
+            
+            # 应用指数退避等待
+            delay = INITIAL_DELAY * (2 ** attempt)
+            await asyncio.sleep(delay)
+            continue
+            
+    # ----------------------------------------------------
+    # 4. 达到最大重试次数
+    # ----------------------------------------------------
+    logger.error(f"Failed to fetch {owner}/{repo}/{path} after {MAX_RETRIES} attempts.")
+    return None
+
+           
 
 
 
 # ==================================================
-# 异步：并发抓取 pyproject.toml 和 requirements.txt
+# ✅ 异步：并发抓取 pyproject.toml 和 requirements.txt
 # ==================================================
 async def _collect_deps(owner: str, repo: str, token: str) -> list[str]:
     """
@@ -113,6 +131,10 @@ async def get_llm_compatibility(prompt: str):
         # 如果 LLM 失败，默认不兼容
             return "NO"
 
+
+# ==================================================
+# ✅ 主流程：并发执行依赖分析
+# ==================================================
 async def dependency_analysis_async(state, config):
     """
     异步版本依赖分析。
